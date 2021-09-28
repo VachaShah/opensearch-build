@@ -4,11 +4,13 @@
 # this file be licensed under the Apache-2.0 license or a
 # compatible open source license.
 
+import logging
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 import requests
 import yaml
@@ -29,6 +31,7 @@ class LocalTestClusterTests(unittest.TestCase):
         )
         self.manifest = BundleManifest.from_path(self.manifest_filename)
         self.work_dir = tempfile.TemporaryDirectory()
+        self.process = self.__get_process()
         self.local_test_cluster = LocalTestCluster(
             self.work_dir.name,
             "sql",
@@ -51,6 +54,11 @@ class LocalTestClusterTests(unittest.TestCase):
             return LocalTestClusterTests.MockResponse({"status": "green"}, 200)
         else:
             return LocalTestClusterTests.MockResponse({"status": "red"}, 404)
+
+    def __get_process(self):
+        return subprocess.Popen((sys.executable, '-c', 'pass'),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
 
     @patch("subprocess.Popen")
     @patch("yaml.dump")
@@ -135,3 +143,47 @@ class LocalTestClusterTests(unittest.TestCase):
             str(err.exception),
             "Cluster is not available after 10 attempts",
         )
+
+    @patch("psutil.Process")
+    @patch("subprocess.Popen.terminate")
+    @patch("subprocess.Popen.wait")
+    @patch("test_workflow.integ_test.local_test_cluster.logging", return_value=MagicMock())
+    def test_terminate_process(self, mock_logging, mock_wait, mock_terminate, mock_process):
+        with self.process as self.local_test_cluster.process, open("stdout-tmp.txt", "w") as self.local_test_cluster.stdout, open("stderr-tmp.txt", "w") as self.local_test_cluster.stderr:
+            self.local_test_cluster.terminate_process()
+            mock_process.assert_called_once_with(self.process.pid)
+            mock_terminate.assert_called_once()
+            mock_wait.assert_called_once_with(10)
+            mock_logging.info.assert_has_calls(
+                [
+                    call(f"Sending SIGTERM to PID {self.process.pid}"),
+                    call("Waiting for process to terminate"),
+                    call(f"Process terminated with exit code {self.process.returncode}")
+                ]
+            )
+            mock_logging.debug.assert_has_calls([call("Checking for child processes")])
+
+    @patch("psutil.Process")
+    @patch("subprocess.Popen.terminate")
+    @patch("subprocess.Popen.wait")
+    @patch("subprocess.Popen.kill")
+    @patch("test_workflow.integ_test.local_test_cluster.logging", return_value=MagicMock())
+    def test_terminate_process_timeout(self, mock_logging, mock_kill, mock_wait, mock_terminate, mock_process):
+        with self.process as self.local_test_cluster.process, open("stdout-tmp.txt", "w") as self.local_test_cluster.stdout, open("stderr-tmp.txt", "w") as self.local_test_cluster.stderr:
+            mock_wait.side_effect = subprocess.TimeoutExpired(cmd='pass', timeout=1)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.local_test_cluster.terminate_process()
+                mock_process.assert_called_once_with(self.process.pid)
+                mock_terminate.assert_called_once()
+                mock_wait.assert_called_with(10)
+                mock_kill.assert_called_once()
+                mock_logging.info.assert_has_calls(
+                    [
+                        call(f"Sending SIGTERM to PID {self.process.pid}"),
+                        call("Waiting for process to terminate"),
+                        call("Process did not terminate after 10 seconds. Sending SIGKILL"),
+                        call("Waiting for process to terminate"),
+                        call("Process failed to terminate even after SIGKILL"),
+                        call(f"Process terminated with exit code {self.process.returncode}")
+                    ]
+                )
